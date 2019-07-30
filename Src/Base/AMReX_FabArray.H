@@ -646,6 +646,22 @@ public:
 		    value_type physbnd, value_type interior);
 
     template <class F=FAB, class = typename std::enable_if<IsBaseFab<F>::value>::type >
+    void BuildMaskA (const Box& phys_domain, const Periodicity& period,
+	 	    value_type covered, value_type notcovered,
+	 	    value_type physbnd, value_type interior);
+
+    template <class F=FAB, class = typename std::enable_if<IsBaseFab<F>::value>::type >
+    void BuildMaskB (const Box& phys_domain, const Periodicity& period,
+	 	    value_type covered, value_type notcovered,
+	 	    value_type physbnd, value_type interior);
+
+    template <class F=FAB, class = typename std::enable_if<IsBaseFab<F>::value>::type >
+    void BuildMaskC (const Box& phys_domain, const Periodicity& period,
+	 	    value_type covered, value_type notcovered,
+	 	    value_type physbnd, value_type interior);
+
+
+    template <class F=FAB, class = typename std::enable_if<IsBaseFab<F>::value>::type >
     void FBEP_nowait (int scomp, int ncomp, const IntVect& nghost,
                       const Periodicity& period, bool cross,
                       bool enforce_periodicity_only = false);
@@ -1853,6 +1869,8 @@ FabArray<FAB>::BuildMask (const Box& phys_domain, const Periodicity& period,
 {
     // TODO gpu
 
+    amrex::Print() << " BuildMask Start " << std::endl;
+
     int ncomp = this->nComp();
     const IntVect& ngrow = this->nGrowVect();
 
@@ -1904,7 +1922,327 @@ FabArray<FAB>::BuildMask (const Box& phys_domain, const Periodicity& period,
 	    (*this)[tag.dstIndex].setVal(covered, tag.dbox, 0, ncomp);
 	}
     }
+
+    amrex::Print() << " BuildMask Stop " << std::endl;
 }
+
+template <class FAB>
+template <class FOO, class BAR>
+void
+FabArray<FAB>::BuildMaskA (const Box& phys_domain, const Periodicity& period,
+			   value_type covered, value_type notcovered,
+			   value_type physbnd, value_type interior)
+{
+    // TODO gpu
+
+    amrex::Print() << " BuildMaskA Start " << std::endl;
+
+    int ncomp = this->nComp();
+    const IntVect& ngrow = this->nGrowVect();
+    const IndexType& idxType = this->ixType();
+
+    const FabArrayBase::FB& TheFB = this->getFB(ngrow,period);
+
+    const CopyComTagsContainer&      LocTags = *(TheFB.m_LocTags);
+    const MapOfCopyComTagContainers& RcvTags = *(TheFB.m_RcvTags);
+
+    Box domain = amrex::convert(phys_domain, boxArray().ixType());
+    for (int i = 0; i < AMREX_SPACEDIM; ++i) {
+	if (period.isPeriodic(i)) {
+	    domain.grow(i, ngrow[i]);
+	}
+    }
+
+    // List of comm boxes, one for each fab. Will be given "covered" value.
+    amrex::Vector<BoxList> bxlsts(this->size());
+    for (int i = 0; i < this->size(); ++i)
+    {
+        bxlsts[i].set(idxType);
+    }
+
+    int N_locs = LocTags.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_loc)
+#endif
+    for (int i = 0; i < N_locs; ++i) {
+	const CopyComTag& tag = LocTags[i];
+        bxlsts[tag.dstIndex].push_back(tag.dbox);
+    }
+
+    for (MapOfCopyComTagContainers::const_iterator it = RcvTags.begin(); it != RcvTags.end(); ++it) {
+	int N = it->second.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_rcv)
+#endif
+	for (int i = 0; i < N; ++i) {
+	    const CopyComTag& tag = it->second[i];
+            bxlsts[tag.dstIndex].push_back(tag.dbox);
+	}
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel if(Gpu::notInLaunchRegion())
+#endif
+    for (MFIter mfi(*this, TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        int idx = mfi.index();
+        int blsize = bxlsts[idx].size(); 
+        AsyncArray<Box> cbxs((bxlsts[idx]).data().data(), blsize);
+        Box* cbxs_p = cbxs.data();
+
+        const auto arr = this->array(mfi); 
+         
+	const Box&  gbx = mfi.growntilebox();
+	const Box& ncbx = gbx & domain;
+	const Box&  tbx = mfi.tilebox();
+
+        AMREX_HOST_DEVICE_FOR_3D(gbx, i, j, k,
+        {
+            IntVect cell(i,j,k);
+            for (int b=0; b<blsize; ++b)
+            {
+                if ((cbxs_p+b)->contains(cell))
+                {
+                    for (int n=0; n<ncomp; ++n)
+                        { arr(i,j,k,n) = covered; }
+                    return;
+                } 
+            }
+
+            if (tbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = interior; }
+                return;
+            }
+
+            else if (ncbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = notcovered; }
+                return;
+            }
+
+            else if (gbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = physbnd; }
+                return;
+            }
+        });
+
+    }
+
+    amrex::Print() << " BuildMaskA Stop " << std::endl;
+}
+
+
+// DON'T DO THIS!! removeOverlap MUST BE CELL-CENTERED.
+// CONVERTING & RUNNING removeOverlap VERY LIKELY NOT BEST OPTION.
+template <class FAB>
+template <class FOO, class BAR>
+void
+FabArray<FAB>::BuildMaskB (const Box& phys_domain, const Periodicity& period,
+			   value_type covered, value_type notcovered,
+			   value_type physbnd, value_type interior)
+{
+
+    amrex::Print() << " BuildMaskB Start " << std::endl;
+
+    int ncomp = this->nComp();
+    const IntVect& ngrow = this->nGrowVect();
+    const IndexType& idxType = this->ixType();
+
+    const FabArrayBase::FB& TheFB = this->getFB(ngrow,period);
+
+    const CopyComTagsContainer&      LocTags = *(TheFB.m_LocTags);
+    const MapOfCopyComTagContainers& RcvTags = *(TheFB.m_RcvTags);
+
+    Box domain = amrex::convert(phys_domain, boxArray().ixType());
+    for (int i = 0; i < AMREX_SPACEDIM; ++i) {
+	if (period.isPeriodic(i)) {
+	    domain.grow(i, ngrow[i]);
+	}
+    }
+
+    // List of comm boxes, one for each fab. Will be given "covered" value.
+    amrex::Vector<BoxList> bxlsts(this->size());
+    for (int i = 0; i < this->size(); ++i)
+    {
+        bxlsts[i].set(idxType);
+    }
+
+    int N_locs = LocTags.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_loc)
+#endif
+    for (int i = 0; i < N_locs; ++i) {
+	const CopyComTag& tag = LocTags[i];
+        bxlsts[tag.dstIndex].push_back(tag.dbox);
+    }
+
+    for (MapOfCopyComTagContainers::const_iterator it = RcvTags.begin(); it != RcvTags.end(); ++it) {
+	int N = it->second.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_rcv)
+#endif
+	for (int i = 0; i < N; ++i) {
+	    const CopyComTag& tag = it->second[i];
+            bxlsts[tag.dstIndex].push_back(tag.dbox);
+	}
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel if(Gpu::notInLaunchRegion())
+#endif
+    for (MFIter mfi(*this, TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        int idx = mfi.index();
+        const auto arr = this->array(mfi); 
+         
+	Box gbx = mfi.growntilebox();
+        AMREX_HOST_DEVICE_FOR_4D(gbx, ncomp, i, j, k, n,
+        {
+           arr(i,j,k,n) = physbnd;
+        });
+
+	const Box& ncbx = gbx & domain;
+        AMREX_HOST_DEVICE_FOR_4D(ncbx, ncomp, i, j, k, n,
+        {
+           arr(i,j,k,n) = notcovered;
+        });
+
+	const Box& tbx = mfi.tilebox();
+        AMREX_HOST_DEVICE_FOR_4D(tbx, ncomp, i, j, k, n,
+        {
+           arr(i,j,k,n) = interior;
+        });
+     
+        BoxList bl = removeOverlap(bxlsts[idx]);
+
+        for (int b=0; b<bl.size(); ++b)
+        {
+            const Box& cbx = bl.data()[b];
+            AMREX_HOST_DEVICE_FOR_4D(cbx, ncomp, i, j, k, n,
+            {
+                arr(i,j,k,n) = covered;
+            });
+        }
+    }
+    amrex::Print() << " BuildMaskB Stop " << std::endl;
+
+}
+
+
+template <class FAB>
+template <class FOO, class BAR>
+void
+FabArray<FAB>::BuildMaskC (const Box& phys_domain, const Periodicity& period,
+			   value_type covered, value_type notcovered,
+			   value_type physbnd, value_type interior)
+{
+    // TODO gpu
+
+    amrex::Print() << " BuildMaskC Start " << std::endl;
+
+    int ncomp = this->nComp();
+    const IntVect& ngrow = this->nGrowVect();
+    const IndexType& idxType = this->ixType();
+
+    const FabArrayBase::FB& TheFB = this->getFB(ngrow,period);
+
+    const CopyComTagsContainer&      LocTags = *(TheFB.m_LocTags);
+    const MapOfCopyComTagContainers& RcvTags = *(TheFB.m_RcvTags);
+
+    Box domain = amrex::convert(phys_domain, boxArray().ixType());
+    for (int i = 0; i < AMREX_SPACEDIM; ++i) {
+	if (period.isPeriodic(i)) {
+	    domain.grow(i, ngrow[i]);
+	}
+    }
+
+    // List of comm boxes, one for each fab. Will be given "covered" value.
+    amrex::Vector<BoxList> bxlsts(this->size());
+    for (int i = 0; i < this->size(); ++i)
+    {
+        bxlsts[i].set(idxType);
+    }
+
+    int N_locs = LocTags.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_loc)
+#endif
+    for (int i = 0; i < N_locs; ++i) {
+	const CopyComTag& tag = LocTags[i];
+        bxlsts[tag.dstIndex].push_back(tag.dbox);
+    }
+
+    for (MapOfCopyComTagContainers::const_iterator it = RcvTags.begin(); it != RcvTags.end(); ++it) {
+	int N = it->second.size();
+#ifdef _OPENMP
+#pragma omp parallel for if (TheFB.m_threadsafe_rcv)
+#endif
+	for (int i = 0; i < N; ++i) {
+	    const CopyComTag& tag = it->second[i];
+            bxlsts[tag.dstIndex].push_back(tag.dbox);
+	}
+    }
+
+#ifdef _OPENMP
+#pragma omp parallel if(Gpu::notInLaunchRegion())
+#endif
+    for (MFIter mfi(*this, TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        int idx = mfi.index();
+        int blsize = bxlsts[idx].size(); 
+        AsyncArray<Box> cbxs((bxlsts[idx]).data().data(), blsize);
+        Box* cbxs_p = cbxs.data();
+
+        const auto arr = this->array(mfi); 
+         
+	const Box&  gbx = mfi.growntilebox();
+	const Box& ncbx = gbx & domain;
+	const Box&  tbx = mfi.tilebox();
+
+        AMREX_HOST_DEVICE_FOR_3D(gbx, i, j, k,
+        {
+            IntVect cell(i,j,k);
+
+            if (gbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = physbnd; }
+            }
+
+            if (ncbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = notcovered; }
+            }
+
+            if (tbx.contains(cell))
+            {
+                for (int n=0; n<ncomp; ++n)
+                    { arr(i,j,k,n) = interior; }
+            }
+
+            for (int b=0; b<blsize; ++b)
+            {
+                if ((cbxs_p+b)->contains(cell))
+                {
+                    for (int n=0; n<ncomp; ++n)
+                        { arr(i,j,k,n) = covered; }
+                } 
+            }
+
+        });
+
+    }
+
+    amrex::Print() << " BuildMaskC Stop " << std::endl;
+}
+
+
 
 }
 
